@@ -100,6 +100,16 @@ static BOOL fauxFormatBoolNo(id self, SEL _cmd) { return NO; }
 static float fauxFormatFloatFOV(id self, SEL _cmd) { return 60.0f; }
 static CGFloat fauxFormatZoomOne(id self, SEL _cmd) { return 1.0; }
 static long fauxFormatAutoFocusSystem(id self, SEL _cmd) { return 0; }
+// supportedMaxPhotoDimensions is a REAL inherited method on AVCaptureDeviceFormat,
+// so the runtime calls the superclass IMP (which reads a null ivar on our synthetic
+// instance -> EXC_BAD_ACCESS) instead of the forwarding net. Clients such as
+// react-native-vision-camera read it to derive photo dimensions, so return a single
+// entry matching the configured frame size.
+static id fauxFormatSupportedMaxPhotoDimensions(id self, SEL _cmd) {
+    CMVideoDimensions dims = { faux_config_width(), faux_config_height() };
+    NSValue *value = [NSValue valueWithBytes:&dims objCType:@encode(CMVideoDimensions)];
+    return @[value];
+}
 
 // Benign forwarding net for fake AV subclasses: any selector with no IMP anywhere returns nil/zero
 // instead of crashing.
@@ -135,6 +145,7 @@ static id fauxSharedFormat(void) {
             class_addMethod(formatClass, @selector(isVideoHDRSupported), (IMP)fauxFormatBoolNo, "B@:");
             class_addMethod(formatClass, @selector(isHighestPhotoQualitySupported), (IMP)fauxFormatBoolNo, "B@:");
             class_addMethod(formatClass, @selector(autoFocusSystem), (IMP)fauxFormatAutoFocusSystem, "q@:");
+            class_addMethod(formatClass, @selector(supportedMaxPhotoDimensions), (IMP)fauxFormatSupportedMaxPhotoDimensions, "@@:");
             objc_registerClassPair(formatClass);
             fauxAVInstallNet(formatClass);
         }

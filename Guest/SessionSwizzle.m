@@ -720,6 +720,10 @@ static id fauxConnectionNilObject(id self, SEL _cmd) { return nil; }
 static double fauxConnectionZeroDouble(id self, SEL _cmd) { return 0; }
 static long fauxConnectionZeroLong(id self, SEL _cmd) { return 0; }
 static NSString *fauxConnectionDescription(id self, SEL _cmd) { return @"<FauxCaptureConnection>"; }
+// mediaType is a REAL inherited method (reads a zeroed ivar on our synthetic
+// instance -> crash), and it is walked by -[AVCaptureSession _updateHardwareCost]
+// during session configuration, so give it a valid media type.
+static NSString *fauxConnectionMediaType(id self, SEL _cmd) { return AVMediaTypeVideo; }
 static void fauxConnectionSetLong(id self, SEL _cmd, long v) { }
 static void fauxConnectionSetDouble(id self, SEL _cmd, double v) { }
 static void fauxConnectionSetBool(id self, SEL _cmd, BOOL v) { }
@@ -776,6 +780,7 @@ static Class fauxConnectionClass(void) {
         class_addMethod(connectionClass, @selector(output), (IMP)fauxConnectionNilObject, "@@:");
         class_addMethod(connectionClass, @selector(videoPreviewLayer), (IMP)fauxConnectionVideoPreviewLayer, "@@:");
         class_addMethod(connectionClass, @selector(description), (IMP)fauxConnectionDescription, "@@:");
+        class_addMethod(connectionClass, @selector(mediaType), (IMP)fauxConnectionMediaType, "@@:");
         objc_registerClassPair(connectionClass);
         fauxInstallForwardingNet(connectionClass);
     });
