@@ -188,6 +188,22 @@ static id fauxDeviceEmptyArray(id self, SEL _cmd) { return @[]; }
 static CGPoint fauxDevicePointCenter(id self, SEL _cmd) { return CGPointMake(0.5, 0.5); }
 static void fauxDeviceSetPoint(id self, SEL _cmd, CGPoint p) { }
 
+// Completion-handler configuration setters. On a real device these apply a hardware change and
+// invoke the handler with the sync time once it lands; the real impls also throw
+// NSInvalidArgumentException ("Not supported - use -is…ModeSupported:") on the fake (zeroed) device.
+// Camera frameworks (vision-camera) call these during device setup (e.g. resetting exposure bias),
+// so override them as no-ops. Invoke the handler (if any) with kCMTimeInvalid so callers that await
+// it don't stall. The block arg is encoded "@?".
+static void fauxDeviceSetFloatCompletion(id self, SEL _cmd, float value, void (^handler)(CMTime)) {
+    if (handler) handler(kCMTimeInvalid);
+}
+static void fauxDeviceSetExposureCustomCompletion(id self, SEL _cmd, CMTime duration, float iso, void (^handler)(CMTime)) {
+    if (handler) handler(kCMTimeInvalid);
+}
+static void fauxDeviceSetWhiteBalanceGainsCompletion(id self, SEL _cmd, AVCaptureWhiteBalanceGains gains, void (^handler)(CMTime)) {
+    if (handler) handler(kCMTimeInvalid);
+}
+
 static void fauxAddDeviceConfigMethods(Class deviceClass) {
     NSString *cmTimeGet = [NSString stringWithFormat:@"%s@:", @encode(CMTime)];
     NSString *cmTimeSet = [NSString stringWithFormat:@"v@:%s", @encode(CMTime)];
@@ -256,6 +272,14 @@ static void fauxAddDeviceConfigMethods(Class deviceClass) {
     class_addMethod(deviceClass, @selector(isAdjustingFocus), (IMP)fauxDeviceBoolNo, "B@:");
     class_addMethod(deviceClass, @selector(isAdjustingExposure), (IMP)fauxDeviceBoolNo, "B@:");
     class_addMethod(deviceClass, @selector(isAdjustingWhiteBalance), (IMP)fauxDeviceBoolNo, "B@:");
+    // Completion-handler configuration setters (throw "Not supported" on the fake device otherwise).
+    NSString *floatCompletion = [NSString stringWithFormat:@"v@:f@?"];
+    NSString *exposureCustom = [NSString stringWithFormat:@"v@:%sf@?", @encode(CMTime)];
+    NSString *wbGainsCompletion = [NSString stringWithFormat:@"v@:%s@?", @encode(AVCaptureWhiteBalanceGains)];
+    class_addMethod(deviceClass, @selector(setExposureTargetBias:completionHandler:), (IMP)fauxDeviceSetFloatCompletion, floatCompletion.UTF8String);
+    class_addMethod(deviceClass, @selector(setFocusModeLockedWithLensPosition:completionHandler:), (IMP)fauxDeviceSetFloatCompletion, floatCompletion.UTF8String);
+    class_addMethod(deviceClass, @selector(setExposureModeCustomWithDuration:ISO:completionHandler:), (IMP)fauxDeviceSetExposureCustomCompletion, exposureCustom.UTF8String);
+    class_addMethod(deviceClass, @selector(setWhiteBalanceModeLockedWithDeviceWhiteBalanceGains:completionHandler:), (IMP)fauxDeviceSetWhiteBalanceGainsCompletion, wbGainsCompletion.UTF8String);
 }
 
 // MARK: - Fake device construction

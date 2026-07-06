@@ -43,6 +43,7 @@ static void fauxInstallForwardingNet(Class cls);
 static IMP fauxNSObjectInit;
 static IMP fauxOriginalInputInit;
 static IMP fauxOriginalInputPorts;
+static IMP fauxOriginalInputDevice;
 static IMP fauxOriginalPreviewSetSession;
 static IMP fauxOriginalPreviewSetSessionNoConn;
 static IMP fauxOriginalPreviewInitWithSession;
@@ -899,7 +900,14 @@ static NSArray *fauxMetadataAvailableTypes(id self, SEL _cmd) {
             AVMetadataObjectTypePDF417Code, AVMetadataObjectTypeUPCECode, AVMetadataObjectTypeCode39Code,
             AVMetadataObjectTypeCode93Code, AVMetadataObjectTypeCode128Code, AVMetadataObjectTypeCode39Mod43Code,
             AVMetadataObjectTypeAztecCode, AVMetadataObjectTypeITF14Code, AVMetadataObjectTypeDataMatrixCode,
-            AVMetadataObjectTypeInterleaved2of5Code
+            AVMetadataObjectTypeInterleaved2of5Code,
+            // iOS 15.4+ additions. Apps such as vision-camera validate their requested codeTypes
+            // against this list, so advertising every type avoids spurious "codeType X is not
+            // supported by the Code Scanner" errors (e.g. codabar). All are >= iOS 15.4, well below
+            // FauxCam's supported runtime, so they are always present (never nil in the literal).
+            AVMetadataObjectTypeCodabarCode, AVMetadataObjectTypeGS1DataBarCode,
+            AVMetadataObjectTypeGS1DataBarExpandedCode, AVMetadataObjectTypeGS1DataBarLimitedCode,
+            AVMetadataObjectTypeMicroQRCode, AVMetadataObjectTypeMicroPDF417Code
         ];
         NSMutableArray *valid = [NSMutableArray array];
         for (AVMetadataObjectType type in candidates) {
@@ -966,6 +974,17 @@ static id fauxInputPorts(id self, SEL _cmd) {
     if (fauxInputIsFake(self)) return @[];
     if (fauxOriginalInputPorts) return ((id (*)(id, SEL))fauxOriginalInputPorts)(self, _cmd);
     return @[];
+}
+
+/// A fake AVCaptureDeviceInput was allocated via NSObject.init (no real designated init), so its
+/// internal device ivar is garbage. The real `-device` getter dereferences it and crashes
+/// (EXC_BAD_ACCESS) — e.g. vision-camera's CameraSession.configureOrientation reads
+/// `videoDeviceInput.device`. Return the fake AVCaptureDevice we stashed at init time instead.
+static id fauxInputDevice(id self, SEL _cmd) {
+    id device = objc_getAssociatedObject(self, kFakeInputDeviceKey);
+    if (device) return device;
+    if (fauxOriginalInputDevice) return ((id (*)(id, SEL))fauxOriginalInputDevice)(self, _cmd);
+    return nil;
 }
 
 // Synthetic session graph bookkeeping so apps that read session.inputs/.outputs (a common
@@ -1174,6 +1193,17 @@ static BOOL fauxSessionCanAddOutput(id self, SEL _cmd, id output) { return YES; 
 static BOOL fauxSessionCanAddConnection(id self, SEL _cmd, id connection) { return YES; }
 static void fauxSessionVoidNoArg(id self, SEL _cmd) { }
 
+// Some apps (e.g. react-native-vision-camera) commit their session through a path that reaches the
+// private -[AVCaptureSession _buildAndRunGraph:] instead of the public commit/startRunning we already
+// no-op. On the simulator that drives FigCaptureSessionSimulator, which has no real capture hardware
+// and signals err=-12782 -> AVCaptureSessionRuntimeError (-11800). That runtime error makes the app
+// abort configuration BEFORE it calls startRunning, so our frame pump (which starts in startRunning)
+// never runs and the preview stays black. Neutralise the private graph build: the faux pump overlays
+// frames on the preview layer itself and doesn't need the real graph.
+static void fauxSessionBuildAndRunGraph(id self, SEL _cmd, BOOL skipConfig) {
+    os_log(fauxSessionLog(), "buildAndRunGraph suppressed skipConfig=%d", skipConfig);
+}
+
 static void fauxSessionAddConnection(id self, SEL _cmd, id connection) {
     // Real connections don't exist on the simulator; the faux pump already fans out. If the
     // connection carries a preview layer (NoConnections preview path), register it.
@@ -1229,6 +1259,8 @@ static void fauxInstallSessionClass(Class sessionClass) {
     fauxReplaceInstanceMethod(sessionClass, @selector(canAddConnection:), (IMP)fauxSessionCanAddConnection, "B@:@");
     fauxReplaceInstanceMethod(sessionClass, @selector(startRunning), (IMP)fauxSessionStartRunning, "v@:");
     fauxReplaceInstanceMethod(sessionClass, @selector(stopRunning), (IMP)fauxSessionStopRunning, "v@:");
+    // Private graph-build path used by some apps (vision-camera). See fauxSessionBuildAndRunGraph.
+    fauxReplaceInstanceMethod(sessionClass, @selector(_buildAndRunGraph:), (IMP)fauxSessionBuildAndRunGraph, "v@:B");
     fauxReplaceInstanceMethod(sessionClass, @selector(canAddInput:), (IMP)fauxSessionCanAddInput, "B@:@");
     fauxReplaceInstanceMethod(sessionClass, @selector(canAddOutput:), (IMP)fauxSessionCanAddOutput, "B@:@");
     fauxReplaceInstanceMethod(sessionClass, @selector(beginConfiguration), (IMP)fauxSessionVoidNoArg, "v@:");
@@ -1260,6 +1292,7 @@ void FauxInstallCaptureSession(void) {
         if (inputClass) {
             fauxOriginalInputInit = fauxReplaceInstanceMethod(inputClass, @selector(initWithDevice:error:), (IMP)fauxInputInitWithDevice, "@@:@^@");
             fauxOriginalInputPorts = fauxReplaceInstanceMethod(inputClass, @selector(ports), (IMP)fauxInputPorts, "@@:");
+            fauxOriginalInputDevice = fauxReplaceInstanceMethod(inputClass, @selector(device), (IMP)fauxInputDevice, "@@:");
         }
         Class outputClass = objc_getClass("AVCaptureVideoDataOutput");
         if (outputClass) {
