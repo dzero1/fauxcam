@@ -12,6 +12,7 @@
 @import CoreMedia;
 @import CoreImage;
 @import QuartzCore;
+@import Vision;
 
 static const uint8_t kSourcePixelBlue = 255;
 static const uint8_t kSourcePixelGreen = 0;
@@ -100,9 +101,13 @@ static os_log_t fauxSessionLog(void) {
 // MARK: - Fake metadata object (machine-readable code)
 
 static const void *kMetadataStringKey = &kMetadataStringKey;
+static const void *kMetadataTypeKey = &kMetadataTypeKey;
 
 static NSString *fauxMetadataStringValue(id self, SEL _cmd) { return objc_getAssociatedObject(self, kMetadataStringKey); }
-static AVMetadataObjectType fauxMetadataType(id self, SEL _cmd) { return AVMetadataObjectTypeQRCode; }
+static AVMetadataObjectType fauxMetadataType(id self, SEL _cmd) {
+    AVMetadataObjectType type = objc_getAssociatedObject(self, kMetadataTypeKey);
+    return type ?: AVMetadataObjectTypeQRCode;
+}
 static CGRect fauxMetadataBounds(id self, SEL _cmd) { return CGRectMake(0.25, 0.25, 0.5, 0.5); }
 static NSArray *fauxMetadataCorners(id self, SEL _cmd) {
     return @[ @{@"X": @0.25, @"Y": @0.25}, @{@"X": @0.75, @"Y": @0.25}, @{@"X": @0.75, @"Y": @0.75}, @{@"X": @0.25, @"Y": @0.75} ];
@@ -136,11 +141,12 @@ static Class fauxMetadataObjectClass(void) {
     return metadataClass;
 }
 
-static id fauxMakeMetadataObject(NSString *string) {
+static id fauxMakeMetadataObject(NSString *string, AVMetadataObjectType type) {
     Class metadataClass = fauxMetadataObjectClass();
     if (!metadataClass) return nil;
     id object = class_createInstance(metadataClass, 0);
     objc_setAssociatedObject(object, kMetadataStringKey, string, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(object, kMetadataTypeKey, type, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return object;
 }
 
@@ -152,6 +158,117 @@ static CIDetector *fauxQRDetector(void) {
                                       options:@{ CIDetectorAccuracy: CIDetectorAccuracyLow }];
     });
     return detector;
+}
+
+// Map a Vision symbology to the AVMetadataObjectType apps key their scanners on.
+static AVMetadataObjectType fauxTypeForSymbology(VNBarcodeSymbology symbology) {
+    static NSDictionary<VNBarcodeSymbology, AVMetadataObjectType> *map;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableDictionary *m = [NSMutableDictionary dictionary];
+        m[VNBarcodeSymbologyQR] = AVMetadataObjectTypeQRCode;
+        m[VNBarcodeSymbologyCode128] = AVMetadataObjectTypeCode128Code;
+        m[VNBarcodeSymbologyCode39] = AVMetadataObjectTypeCode39Code;
+        m[VNBarcodeSymbologyCode39Checksum] = AVMetadataObjectTypeCode39Mod43Code;
+        m[VNBarcodeSymbologyCode39FullASCII] = AVMetadataObjectTypeCode39Code;
+        m[VNBarcodeSymbologyCode39FullASCIIChecksum] = AVMetadataObjectTypeCode39Mod43Code;
+        m[VNBarcodeSymbologyCode93] = AVMetadataObjectTypeCode93Code;
+        m[VNBarcodeSymbologyCode93i] = AVMetadataObjectTypeCode93Code;
+        m[VNBarcodeSymbologyEAN13] = AVMetadataObjectTypeEAN13Code;
+        m[VNBarcodeSymbologyEAN8] = AVMetadataObjectTypeEAN8Code;
+        m[VNBarcodeSymbologyUPCE] = AVMetadataObjectTypeUPCECode;
+        m[VNBarcodeSymbologyPDF417] = AVMetadataObjectTypePDF417Code;
+        m[VNBarcodeSymbologyAztec] = AVMetadataObjectTypeAztecCode;
+        m[VNBarcodeSymbologyDataMatrix] = AVMetadataObjectTypeDataMatrixCode;
+        m[VNBarcodeSymbologyITF14] = AVMetadataObjectTypeITF14Code;
+        m[VNBarcodeSymbologyI2of5] = AVMetadataObjectTypeInterleaved2of5Code;
+        m[VNBarcodeSymbologyI2of5Checksum] = AVMetadataObjectTypeInterleaved2of5Code;
+        if (@available(iOS 15.0, *)) {
+            m[VNBarcodeSymbologyCodabar] = AVMetadataObjectTypeCodabarCode;
+            m[VNBarcodeSymbologyGS1DataBar] = AVMetadataObjectTypeGS1DataBarCode;
+            m[VNBarcodeSymbologyGS1DataBarExpanded] = AVMetadataObjectTypeGS1DataBarExpandedCode;
+            m[VNBarcodeSymbologyGS1DataBarLimited] = AVMetadataObjectTypeGS1DataBarLimitedCode;
+            m[VNBarcodeSymbologyMicroQR] = AVMetadataObjectTypeMicroQRCode;
+            m[VNBarcodeSymbologyMicroPDF417] = AVMetadataObjectTypeMicroPDF417Code;
+        }
+        map = m;
+    });
+    return map[symbology];
+}
+
+// Detect machine-readable codes in the frame. Vision's VNDetectBarcodesRequest
+// covers 1D + 2D symbologies (CODE128, EAN, UPC, QR, …), unlike CoreImage's
+// CIDetector which is QR-only — that gap meant 1D barcodes rendered in the
+// preview but never produced metadata, so scanner apps never fired. Returns
+// FauxMetadataMachineReadableCodeObject instances; falls back to the legacy
+// QR-only CIDetector if Vision fails.
+static NSArray *fauxObservationsToMetadataObjects(NSArray *results, NSMutableArray *objects) {
+    for (VNBarcodeObservation *observation in results) {
+        NSString *payload = observation.payloadStringValue;
+        if (payload.length == 0) continue;
+        AVMetadataObjectType type = fauxTypeForSymbology(observation.symbology);
+        if (!type) continue;
+        id object = fauxMakeMetadataObject(payload, type);
+        if (object) [objects addObject:object];
+    }
+    return objects;
+}
+
+static NSArray *fauxDetectMetadataObjects(CVPixelBufferRef buffer) {
+    NSMutableArray *objects = [NSMutableArray array];
+    static int diagnosticCalls = 0;
+    BOOL diagnose = diagnosticCalls < 5;
+    if (diagnose) diagnosticCalls++;
+    // The pump queue thread never drains an autorelease pool, so per-frame Vision
+    // handlers/contexts pile up and the simulator soon fails with "Could not
+    // create inference context" — pool every pass.
+    @autoreleasepool {
+        VNImageRequestHandler *handler =
+            [[VNImageRequestHandler alloc] initWithCVPixelBuffer:buffer options:@{}];
+        // Modern (ML-based) detector first: full symbology coverage. On most
+        // simulators it can NEVER create an inference context, so once it fails
+        // stop paying for the attempt on every pass and go straight to rev1.
+        static BOOL defaultDetectorBroken = NO;
+        if (!defaultDetectorBroken) {
+            VNDetectBarcodesRequest *request = [[VNDetectBarcodesRequest alloc] init];
+            NSError *error = nil;
+            BOOL performed = [handler performRequests:@[request] error:&error];
+            if (performed && request.results.count > 0) {
+                if (diagnose) os_log(fauxSessionLog(), "Vision detected %lu code(s)",
+                                     (unsigned long)request.results.count);
+                return fauxObservationsToMetadataObjects(request.results, objects);
+            }
+            if (!performed) {
+                defaultDetectorBroken = YES;
+                os_log(fauxSessionLog(), "Vision (default) failed: %{public}@ — using rev1 (CPU) from now on",
+                       error.localizedDescription);
+            }
+        }
+        // Revision 1 is the classic CPU detector — no ML inference context, so it
+        // keeps working when the simulator's ML stack can't allocate one.
+        VNDetectBarcodesRequest *cpuRequest = [[VNDetectBarcodesRequest alloc] init];
+        cpuRequest.revision = VNDetectBarcodesRequestRevision1;
+        NSError *error = nil;
+        if ([handler performRequests:@[cpuRequest] error:&error]) {
+            if (diagnose) os_log(fauxSessionLog(), "Vision rev1 detected %lu code(s)",
+                                 (unsigned long)cpuRequest.results.count);
+            if (cpuRequest.results.count > 0) {
+                return fauxObservationsToMetadataObjects(cpuRequest.results, objects);
+            }
+            return objects;
+        }
+        if (diagnose) {
+            os_log(fauxSessionLog(), "Vision rev1 failed (%{public}@); falling back to CIDetector QR",
+                   error.localizedDescription);
+        }
+        NSArray *features = [fauxQRDetector() featuresInImage:[CIImage imageWithCVPixelBuffer:buffer]];
+        for (CIQRCodeFeature *feature in features) {
+            if (feature.messageString.length == 0) continue;
+            id object = fauxMakeMetadataObject(feature.messageString, AVMetadataObjectTypeQRCode);
+            if (object) [objects addObject:object];
+        }
+    }
+    return objects;
 }
 
 @interface FauxMetadataTarget : NSObject
@@ -424,15 +541,8 @@ static id fauxMakePhoto(CVPixelBufferRef buffer, id resolvedSettings) {
     }
     CVPixelBufferRef buffer = [self copyLatestImageBuffer];
     if (!buffer) return;
-    NSArray *features = [fauxQRDetector() featuresInImage:[CIImage imageWithCVPixelBuffer:buffer]];
+    NSArray *objects = fauxDetectMetadataObjects(buffer);
     CVPixelBufferRelease(buffer);
-
-    NSMutableArray *objects = [NSMutableArray array];
-    for (CIQRCodeFeature *feature in features) {
-        if (feature.messageString.length == 0) continue;
-        id metadataObject = fauxMakeMetadataObject(feature.messageString);
-        if (metadataObject) [objects addObject:metadataObject];
-    }
     if (objects.count == 0) return;
     if (!_loggedMetadataDelivery) {
         _loggedMetadataDelivery = YES;
